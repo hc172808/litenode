@@ -1,0 +1,21 @@
+services:
+  gyds-litenode:
+    build: .
+    container_name: gyds-litenode
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "8545:8545"   # JSON-RPC
+      - "8546:8546"   # WebSocket
+      - "30303:30303" # P2P TCP
+    volumes:
+      - litenode-data:/app/data
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+volumes:
+  litenode-data:
