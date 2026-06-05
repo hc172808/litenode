@@ -1,0 +1,40 @@
+modules = ["go-1.21", "bash"]
+[agent]
+expertMode = true
+stack = "BEST_EFFORT_FALLBACK"
+
+[nix]
+channel = "stable-25_05"
+
+[workflows]
+runButton = "Project"
+
+[[workflows.workflow]]
+name = "Project"
+mode = "parallel"
+author = "agent"
+
+[[workflows.workflow.tasks]]
+task = "workflow.run"
+args = "Start application"
+
+[[workflows.workflow]]
+name = "Start application"
+author = "agent"
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "GOTOOLCHAIN=local go build -o bin/gyds-litenode . && GYDS_RPC_PORT=8000 GYDS_LOG_LEVEL=info ./bin/gyds-litenode start"
+waitForPort = 8000
+
+[workflows.workflow.metadata]
+outputType = "console"
+
+[[ports]]
+localPort = 8000
+externalPort = 8000
+
+[deployment]
+deploymentTarget = "vm"
+run = ["bash", "-c", "GYDS_RPC_PORT=8000 GYDS_LOG_LEVEL=info ./bin/gyds-litenode start"]
+build = ["bash", "-c", "GOTOOLCHAIN=local go build -o bin/gyds-litenode ."]
