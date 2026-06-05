@@ -22,13 +22,13 @@ args = "Start application"
 name = "Start application"
 author = "agent"
 
-[[workflows.workflow.tasks]]
-task = "shell.exec"
-args = "GOTOOLCHAIN=local go build -o bin/gyds-litenode . && GYDS_RPC_PORT=8000 GYDS_LOG_LEVEL=info ./bin/gyds-litenode start"
-waitForPort = 8000
-
 [workflows.workflow.metadata]
 outputType = "console"
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "GOTOOLCHAIN=local go build -o bin/gyds-litenode . && GYDS_RPC_PORT=8000 GYDS_LOG_LEVEL=info GYDS_LOG_FORMAT=pretty ./bin/gyds-litenode start"
+waitForPort = 8000
 
 [[ports]]
 localPort = 8000
