@@ -3,7 +3,7 @@
 set -Eeuo pipefail
 
 ############################################
-# CONFIG
+# CONFIG — edit these before running
 ############################################
 
 APP_NAME="gyds-litenode"
@@ -19,6 +19,10 @@ SSH_PORT="22"
 
 GO_VERSION="1.22.4"
 
+# Optional: bootstrap peer address (leave empty to skip)
+# GYDS_BOOTSTRAP_NODES="tcp://node1.gydschain.io:30303"
+GYDS_BOOTSTRAP_NODES="${GYDS_BOOTSTRAP_NODES:-}"
+
 ############################################
 # COLORS
 ############################################
@@ -26,37 +30,44 @@ GO_VERSION="1.22.4"
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 RED='\033[0;31m'
+CYAN='\033[0;36m'
 NC='\033[0m'
 
-log(){ echo -e "${GREEN}[OK]${NC} $1"; }
-warn(){ echo -e "${YELLOW}[WARN]${NC} $1"; }
-err(){ echo -e "${RED}[ERR]${NC} $1"; }
+log()  { echo -e "${GREEN}[OK]${NC}   $1"; }
+warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
+err()  { echo -e "${RED}[ERR]${NC}  $1"; }
+info() { echo -e "${CYAN}[INFO]${NC} $1"; }
 
 ############################################
 # ROOT CHECK
 ############################################
 
 if [[ "$EUID" -ne 0 ]]; then
-  err "Run as root (sudo ./setup-litenode-server.sh)"
+  err "Run as root: sudo bash setup-litenode-server.sh"
   exit 1
 fi
+
+info "Starting GYDS Litenode setup on Ubuntu 22.04..."
+echo ""
 
 ############################################
 # SYSTEM UPDATE
 ############################################
 
-log "Updating system..."
-apt update && apt upgrade -y
+log "Updating system packages..."
+apt-get update -qq
+DEBIAN_FRONTEND=noninteractive apt-get upgrade -y -qq
 
 ############################################
 # BASE PACKAGES
 ############################################
 
 log "Installing base packages..."
-apt install -y \
+DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
   git curl wget unzip nginx ufw fail2ban \
   build-essential jq htop ca-certificates gnupg \
-  software-properties-common apt-transport-https
+  software-properties-common apt-transport-https \
+  lsb-release logrotate
 
 ############################################
 # GO
@@ -64,14 +75,17 @@ apt install -y \
 
 log "Installing Go ${GO_VERSION}..."
 
-GO_TAR="go${GO_VERSION}.linux-$(dpkg --print-architecture | sed 's/x86_64/amd64/;s/aarch64/arm64/').tar.gz"
+ARCH="$(dpkg --print-architecture)"
+GO_TAR="go${GO_VERSION}.linux-${ARCH}.tar.gz"
 wget -q "https://go.dev/dl/${GO_TAR}" -O /tmp/go.tar.gz
 rm -rf /usr/local/go
 tar -C /usr/local -xzf /tmp/go.tar.gz
 rm /tmp/go.tar.gz
 
 export PATH="/usr/local/go/bin:$PATH"
-echo 'export PATH="/usr/local/go/bin:$PATH"' >> /etc/profile.d/go.sh
+cat > /etc/profile.d/go.sh <<'GOPATH'
+export PATH="/usr/local/go/bin:$PATH"
+GOPATH
 chmod +x /etc/profile.d/go.sh
 
 go version || { err "Go installation failed"; exit 1; }
@@ -83,26 +97,29 @@ go version || { err "Go installation failed"; exit 1; }
 log "Installing Docker..."
 
 install -m 0755 -d /etc/apt/keyrings
-curl -fsSL https://download.docker.com/linux/ubuntu/gpg | \
-  gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
+  | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
 
 echo \
   "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] \
 https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" \
   > /etc/apt/sources.list.d/docker.list
 
-apt update
-apt install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
+apt-get update -qq
+DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+  docker-ce docker-ce-cli containerd.io docker-compose-plugin
 
 systemctl enable docker
-systemctl restart docker
+systemctl start docker
 
 ############################################
 # USER
 ############################################
 
-id "$APP_USER" &>/dev/null || \
-  adduser --disabled-password --gecos "" "$APP_USER"
+log "Creating app user: ${APP_USER}..."
+
+id "$APP_USER" &>/dev/null \
+  || adduser --disabled-password --gecos "" "$APP_USER"
 
 usermod -aG docker "$APP_USER"
 
@@ -110,22 +127,25 @@ usermod -aG docker "$APP_USER"
 # FIREWALL
 ############################################
 
-log "Configuring firewall..."
+log "Configuring UFW firewall..."
+
 ufw default deny incoming
 ufw default allow outgoing
-ufw allow "$SSH_PORT"/tcp
-ufw allow 80/tcp
-ufw allow 443/tcp
-ufw allow "$RPC_PORT"/tcp
-ufw allow "$WS_PORT"/tcp
-ufw allow "$P2P_PORT"/tcp
+ufw allow "${SSH_PORT}"/tcp   comment "SSH"
+ufw allow 80/tcp              comment "HTTP"
+ufw allow 443/tcp             comment "HTTPS"
+ufw allow "${RPC_PORT}"/tcp   comment "GYDS RPC"
+ufw allow "${WS_PORT}"/tcp    comment "GYDS WebSocket"
+ufw allow "${P2P_PORT}"/tcp   comment "GYDS P2P"
 ufw --force enable
+
+log "Firewall rules applied."
 
 ############################################
 # FAIL2BAN
 ############################################
 
-log "Setting up Fail2Ban..."
+log "Configuring Fail2Ban..."
 
 cat > /etc/fail2ban/jail.local <<EOF
 [DEFAULT]
@@ -135,164 +155,265 @@ maxretry = 5
 
 [sshd]
 enabled = true
-port    = $SSH_PORT
+port    = ${SSH_PORT}
 EOF
 
-systemctl restart fail2ban
 systemctl enable fail2ban
+systemctl restart fail2ban
 
 ############################################
 # CLONE OR UPDATE REPO
 ############################################
 
-log "Setting up app directory..."
+log "Setting up application directory: ${APP_DIR}..."
 
 mkdir -p "$APP_DIR"
 
-if [ ! -d "$APP_DIR/.git" ]; then
-  git clone "$REPO_URL" "$APP_DIR"
+if [ ! -d "${APP_DIR}/.git" ]; then
+  git clone --branch "$BRANCH" "$REPO_URL" "$APP_DIR"
+  log "Repository cloned."
 else
   git -C "$APP_DIR" config --global --add safe.directory "$APP_DIR"
   git -C "$APP_DIR" fetch origin
-  git -C "$APP_DIR" reset --hard "origin/$BRANCH"
+  git -C "$APP_DIR" reset --hard "origin/${BRANCH}"
+  log "Repository updated to latest ${BRANCH}."
 fi
 
-chown -R "$APP_USER:$APP_USER" "$APP_DIR"
+chown -R "${APP_USER}:${APP_USER}" "$APP_DIR"
 
 ############################################
 # ENV FILE
 ############################################
 
-log "Setting up .env..."
+log "Creating .env configuration..."
 
-if [ -f "$APP_DIR/.env.example" ]; then
-  cp "$APP_DIR/.env.example" "$APP_DIR/.env"
-else
-  err ".env.example not found in repo"
-  exit 1
-fi
+ENV_FILE="${APP_DIR}/.env"
 
-chown "$APP_USER:$APP_USER" "$APP_DIR/.env"
-chmod 600 "$APP_DIR/.env"
+cat > "$ENV_FILE" <<EOF
+# ─────────────────────────────────────────────
+# GYDS Litenode — Runtime Configuration
+# Generated by setup-litenode-server.sh
+# ─────────────────────────────────────────────
 
-# Append runtime overrides
-cat >> "$APP_DIR/.env" <<EOF
+# Chain
+GYDS_CHAIN_ID=13370
+GYDS_NODE_MODE=lite
 
-# ─── Runtime overrides (set by setup script) ───
-GYDS_RPC_PORT=$RPC_PORT
-GYDS_P2P_PORT=$P2P_PORT
+# Networking
+GYDS_RPC_PORT=${RPC_PORT}
+GYDS_RPC_HOST=0.0.0.0
+GYDS_P2P_PORT=${P2P_PORT}
+
+# Bootstrap peers (comma-separated tcp addresses)
+$([ -n "$GYDS_BOOTSTRAP_NODES" ] && echo "GYDS_BOOTSTRAP_NODES=${GYDS_BOOTSTRAP_NODES}" || echo "# GYDS_BOOTSTRAP_NODES=tcp://node1.gydschain.io:30303")
+
+# Storage
 GYDS_DATA_DIR=/app/data
+
+# Logging  (trace|debug|info|warn|error)
+GYDS_LOG_LEVEL=info
 EOF
 
+chown "${APP_USER}:${APP_USER}" "$ENV_FILE"
+chmod 600 "$ENV_FILE"
+
 ############################################
-# BUILD BINARY (NATIVE — OPTIONAL)
+# BUILD NATIVE BINARY
 ############################################
 
 log "Building GYDS litenode binary..."
 
 export PATH="/usr/local/go/bin:$PATH"
 cd "$APP_DIR"
-make build || go build -ldflags="-s -w" -o bin/gyds-litenode .
 
-log "Binary: $(file "$APP_DIR/bin/gyds-litenode")"
+if ! make build 2>/dev/null; then
+  go build -ldflags="-s -w -X main.version=1.0.0" -o bin/gyds-litenode .
+fi
+
+chown -R "${APP_USER}:${APP_USER}" "${APP_DIR}/bin"
+log "Binary: $(file "${APP_DIR}/bin/gyds-litenode")"
 
 ############################################
 # DOCKER BUILD + START
 ############################################
 
-log "Building Docker image..."
+log "Building Docker image and starting container..."
 
 cd "$APP_DIR"
+
+# Tear down any previous run cleanly
 docker compose down --remove-orphans 2>/dev/null || true
+
 docker compose build --no-cache
 docker compose up -d
 
+# Wait for container to become healthy (up to 60 s)
+info "Waiting for container to become healthy..."
+for i in $(seq 1 12); do
+  HEALTH=$(docker inspect --format='{{.State.Health.Status}}' gyds-litenode 2>/dev/null || echo "none")
+  if [[ "$HEALTH" == "healthy" ]]; then
+    log "Container is healthy."
+    break
+  fi
+  if [[ $i -eq 12 ]]; then
+    warn "Container did not reach healthy state in 60s — check logs: docker compose logs"
+  fi
+  sleep 5
+done
+
 ############################################
-# NGINX
+# NGINX REVERSE PROXY
 ############################################
 
 log "Configuring Nginx reverse proxy..."
 
 rm -f /etc/nginx/sites-enabled/default
 
-cat > /etc/nginx/sites-available/gyds-litenode <<EOF
-# JSON-RPC
+cat > /etc/nginx/sites-available/gyds-litenode <<NGINX
+# GYDS Litenode — JSON-RPC + WebSocket reverse proxy
 server {
     listen 80;
     server_name _;
 
+    # Increase timeouts for long-polling / streaming calls
+    proxy_read_timeout  300s;
+    proxy_send_timeout  300s;
+    proxy_connect_timeout 10s;
+
+    # JSON-RPC + WebSocket
     location / {
-        proxy_pass http://127.0.0.1:$RPC_PORT;
+        proxy_pass         http://127.0.0.1:${RPC_PORT};
         proxy_http_version 1.1;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection "upgrade";
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_read_timeout 300s;
+        proxy_set_header   Upgrade \$http_upgrade;
+        proxy_set_header   Connection "upgrade";
+        proxy_set_header   Host \$host;
+        proxy_set_header   X-Real-IP \$remote_addr;
+        proxy_set_header   X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header   X-Forwarded-Proto \$scheme;
+    }
+
+    # REST API
+    location /api/ {
+        proxy_pass         http://127.0.0.1:${RPC_PORT};
+        proxy_http_version 1.1;
+        proxy_set_header   Host \$host;
+        proxy_set_header   X-Real-IP \$remote_addr;
+        proxy_set_header   X-Forwarded-For \$proxy_add_x_forwarded_for;
+    }
+
+    # Health endpoint (for load-balancer checks)
+    location /health {
+        proxy_pass http://127.0.0.1:${RPC_PORT}/health;
+        access_log off;
     }
 }
-EOF
+NGINX
 
 ln -sf /etc/nginx/sites-available/gyds-litenode \
        /etc/nginx/sites-enabled/gyds-litenode
 
 nginx -t
-systemctl restart nginx
 systemctl enable nginx
+systemctl restart nginx
+
+############################################
+# LOGROTATE FOR HEALTH LOG
+############################################
+
+cat > /etc/logrotate.d/gyds-health <<'LOGROTATE'
+/var/log/gyds-health.log {
+    daily
+    rotate 7
+    compress
+    missingok
+    notifempty
+    create 0640 root root
+}
+LOGROTATE
 
 ############################################
 # HEALTH CHECK SCRIPT
 ############################################
 
-log "Installing health-check helper..."
+log "Installing health-check helper: gyds-health..."
 
-cat > /usr/local/bin/gyds-health.sh <<'EOF'
+cat > /usr/local/bin/gyds-health <<HEALTHSCRIPT
 #!/usr/bin/env bash
 set -euo pipefail
 
-APP_DIR="/opt/gyds-litenode"
-cd "$APP_DIR"
+APP_DIR="${APP_DIR}"
+RPC_PORT="${RPC_PORT}"
 
-if ! docker compose ps | grep -q "Up"; then
-  echo "[WARN] gyds-litenode container not running — restarting..."
+cd "\$APP_DIR"
+
+# Check if container is running
+RUNNING=\$(docker compose ps --status running --quiet 2>/dev/null | wc -l)
+
+if [[ "\$RUNNING" -eq 0 ]]; then
+  echo "\$(date '+%Y-%m-%dT%H:%M:%S') [WARN] Container not running — restarting..."
   docker compose up -d
-else
-  # Quick JSON-RPC ping
-  RESP=$(curl -sf -X POST http://localhost:8545 \
-    -H "Content-Type: application/json" \
-    --data '{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}' || true)
-  if [ -n "$RESP" ]; then
-    echo "[OK] RPC responding — $(echo "$RESP" | grep -o '"result":"[^"]*"')"
-  else
-    echo "[WARN] RPC not responding"
-  fi
+  exit 0
 fi
-EOF
 
-chmod +x /usr/local/bin/gyds-health.sh
+# JSON-RPC ping
+RESP=\$(curl -sf --max-time 5 -X POST "http://localhost:\${RPC_PORT}" \
+  -H "Content-Type: application/json" \
+  --data '{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}' 2>/dev/null || true)
 
-# Cron: run health check every 5 minutes
-(crontab -l 2>/dev/null | grep -v gyds-health; echo "*/5 * * * * /usr/local/bin/gyds-health.sh >> /var/log/gyds-health.log 2>&1") \
+if [[ -n "\$RESP" ]]; then
+  BLOCK=\$(echo "\$RESP" | grep -o '"result":"[^"]*"' | head -1 || echo "unknown")
+  echo "\$(date '+%Y-%m-%dT%H:%M:%S') [OK]   RPC responding — \$BLOCK"
+else
+  echo "\$(date '+%Y-%m-%dT%H:%M:%S') [WARN] RPC not responding — restarting container..."
+  docker compose restart gyds-litenode
+fi
+HEALTHSCRIPT
+
+chmod +x /usr/local/bin/gyds-health
+
+# Cron: health check every 5 minutes
+(crontab -l 2>/dev/null | grep -v "gyds-health"; \
+ echo "*/5 * * * * /usr/local/bin/gyds-health >> /var/log/gyds-health.log 2>&1") \
   | crontab -
 
+log "Health check installed (runs every 5 min, logs → /var/log/gyds-health.log)"
+
 ############################################
-# SYSTEMD SERVICE (NATIVE BINARY FALLBACK)
+# SYSTEMD SERVICE (NATIVE BINARY — OPTIONAL)
+############################################
+# The Docker container is the default runner.
+# Use this service only if you want to run the
+# native binary without Docker.
 ############################################
 
-log "Creating systemd service (native binary)..."
+log "Installing systemd service (native binary — optional)..."
+
+DATA_DIR="${APP_DIR}/data"
+mkdir -p "$DATA_DIR"
+chown "${APP_USER}:${APP_USER}" "$DATA_DIR"
 
 cat > /etc/systemd/system/gyds-litenode.service <<EOF
 [Unit]
-Description=GYDS Litenode
+Description=GYDS Litenode (native binary)
+Documentation=https://github.com/hc172808/litenode
 After=network-online.target
 Wants=network-online.target
 
 [Service]
-User=$APP_USER
-WorkingDirectory=$APP_DIR
-EnvironmentFile=$APP_DIR/.env
-ExecStart=$APP_DIR/bin/gyds-litenode start
+User=${APP_USER}
+WorkingDirectory=${APP_DIR}
+
+# Override data dir to local path (not the Docker /app/data)
+Environment="GYDS_CHAIN_ID=13370"
+Environment="GYDS_NODE_MODE=lite"
+Environment="GYDS_RPC_PORT=${RPC_PORT}"
+Environment="GYDS_RPC_HOST=0.0.0.0"
+Environment="GYDS_P2P_PORT=${P2P_PORT}"
+Environment="GYDS_DATA_DIR=${DATA_DIR}"
+Environment="GYDS_LOG_LEVEL=info"
+$([ -n "$GYDS_BOOTSTRAP_NODES" ] && echo "Environment=\"GYDS_BOOTSTRAP_NODES=${GYDS_BOOTSTRAP_NODES}\"")
+
+ExecStart=${APP_DIR}/bin/gyds-litenode start
 Restart=on-failure
 RestartSec=5s
 LimitNOFILE=65536
@@ -306,30 +427,80 @@ WantedBy=multi-user.target
 EOF
 
 systemctl daemon-reload
-# Note: systemd service is available but Docker is the default runner.
-# To switch: systemctl enable --now gyds-litenode
+# NOTE: systemd service is installed but NOT enabled.
+# To switch from Docker to native binary:
+#   docker compose down
+#   systemctl enable --now gyds-litenode
 
 ############################################
-# FINAL STATUS
+# POST-SETUP VERIFICATION
 ############################################
 
 echo ""
-echo "╔══════════════════════════════════════╗"
-echo "║       GYDS LITENODE DEPLOYED         ║"
-echo "╚══════════════════════════════════════╝"
+log "Running post-setup verification..."
+
+sleep 3  # brief wait for nginx to proxy through
+
+RPC_OK=false
+HTTP_OK=false
+
+# Direct RPC check
+if curl -sf --max-time 5 -X POST "http://localhost:${RPC_PORT}" \
+   -H "Content-Type: application/json" \
+   --data '{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}' \
+   | grep -q '"result"'; then
+  log "Direct RPC (port ${RPC_PORT}): responding"
+  RPC_OK=true
+else
+  warn "Direct RPC (port ${RPC_PORT}): not responding yet"
+fi
+
+# Nginx proxy check
+if curl -sf --max-time 5 http://localhost/health | grep -q '"status"'; then
+  log "Nginx proxy (port 80 → /health): responding"
+  HTTP_OK=true
+else
+  warn "Nginx proxy (port 80): not responding yet"
+fi
+
+if [[ "$RPC_OK" == "false" && "$HTTP_OK" == "false" ]]; then
+  warn "Node may still be starting. Check: docker compose logs -f"
+fi
+
+############################################
+# FINAL SUMMARY
+############################################
+
+SERVER_IP=$(hostname -I | awk '{print $1}')
+
 echo ""
-echo "  JSON-RPC:   http://YOUR_SERVER_IP:$RPC_PORT"
-echo "  WebSocket:  ws://YOUR_SERVER_IP:$WS_PORT"
-echo "  P2P:        tcp://YOUR_SERVER_IP:$P2P_PORT"
+echo "╔══════════════════════════════════════════════╗"
+echo "║         GYDS LITENODE — DEPLOYED             ║"
+echo "╚══════════════════════════════════════════════╝"
 echo ""
-echo "  Via Nginx:  http://YOUR_SERVER_IP"
+echo "  Chain ID:    13370 (GYDS Chain)"
+echo "  Node mode:   lite"
 echo ""
-echo "  Logs:       cd $APP_DIR && docker compose logs -f"
-echo "  Health:     gyds-health.sh"
-echo "  Re-run:     sudo ./setup-litenode-server.sh"
+echo "  JSON-RPC:    http://${SERVER_IP}:${RPC_PORT}"
+echo "  WebSocket:   ws://${SERVER_IP}:${WS_PORT}"
+echo "  P2P:         tcp://${SERVER_IP}:${P2P_PORT}"
 echo ""
-echo "  Quick RPC test:"
-echo '  curl -X POST http://YOUR_SERVER_IP:8545 \'
+echo "  Via Nginx:   http://${SERVER_IP}   (port 80)"
+echo ""
+echo "  ── Useful commands ──────────────────────────"
+echo "  Logs:        cd ${APP_DIR} && docker compose logs -f"
+echo "  Status:      docker compose ps"
+echo "  Health:      gyds-health"
+echo "  Restart:     cd ${APP_DIR} && docker compose restart"
+echo "  Re-run:      sudo bash ${APP_DIR}/setup-litenode-server.sh"
+echo ""
+echo "  ── Quick RPC test ───────────────────────────"
+echo "  curl -X POST http://${SERVER_IP}:${RPC_PORT} \\"
 echo '    -H "Content-Type: application/json" \'
 echo '    --data '"'"'{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}'"'"
+echo ""
+echo "  ── Switch to native binary (no Docker) ──────"
+echo "  cd ${APP_DIR} && docker compose down"
+echo "  systemctl enable --now gyds-litenode"
+echo "  journalctl -u gyds-litenode -f"
 echo ""
