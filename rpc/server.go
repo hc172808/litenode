@@ -32,11 +32,38 @@ type Server struct {
 
 	pendingTx   map[string]*core.Transaction
 	pendingTxMu sync.RWMutex
+
+	// filter registry for eth_newFilter / eth_getFilterChanges
+	filters   map[string]*rpcFilter
+	filtersMu sync.Mutex
+	filterSeq uint64
 }
 
 type subscriber struct {
 	conn *websocket.Conn
 	ch   chan interface{}
+}
+
+// ── Filter registry types ─────────────────────────────────────────────────────
+
+const maxUint64 = ^uint64(0)
+
+type filterKind int
+
+const (
+	filterKindLog     filterKind = iota // eth_newFilter
+	filterKindBlock                     // eth_newBlockFilter
+	filterKindPending                   // eth_newPendingTransactionFilter
+)
+
+type rpcFilter struct {
+	kind      filterKind
+	fromBlock uint64
+	toBlock   uint64     // maxUint64 means "latest"
+	addresses []string   // empty = any address
+	topics    [][]string // stored but not evaluated (no EVM)
+	lastBlock uint64     // highest block returned so far
+	createdAt time.Time
 }
 
 func NewServer(chain *core.Chain, port int) *Server {
@@ -48,6 +75,7 @@ func NewServer(chain *core.Chain, port int) *Server {
 		},
 		subs:      make(map[string]*subscriber),
 		pendingTx: make(map[string]*core.Transaction),
+		filters:   make(map[string]*rpcFilter),
 	}
 	s.setupRoutes()
 	return s
@@ -479,15 +507,72 @@ func (s *Server) dispatch(req jsonRPCRequest) jsonRPCResponse {
 		resp.Result = "0x"
 
 	case "eth_getLogs":
-		resp.Result = []interface{}{}
+		f := s.parseLogFilter(req.Params)
+		resp.Result = s.getLogsForFilter(f)
 
-	case "eth_newFilter", "eth_newBlockFilter", "eth_newPendingTransactionFilter":
-		resp.Result = "0x1"
+	case "eth_newFilter":
+		f := s.parseLogFilter(req.Params)
+		f.lastBlock = s.chain.Height()
+		id := s.newFilterID()
+		s.filtersMu.Lock()
+		s.filters[id] = f
+		s.filtersMu.Unlock()
+		resp.Result = id
+
+	case "eth_newBlockFilter":
+		id := s.newFilterID()
+		s.filtersMu.Lock()
+		s.filters[id] = &rpcFilter{kind: filterKindBlock, lastBlock: s.chain.Height(), createdAt: time.Now()}
+		s.filtersMu.Unlock()
+		resp.Result = id
+
+	case "eth_newPendingTransactionFilter":
+		id := s.newFilterID()
+		s.filtersMu.Lock()
+		s.filters[id] = &rpcFilter{kind: filterKindPending, lastBlock: s.chain.Height(), createdAt: time.Now()}
+		s.filtersMu.Unlock()
+		resp.Result = id
 
 	case "eth_getFilterChanges", "eth_getFilterLogs":
-		resp.Result = []interface{}{}
+		id := paramStr(req.Params, 0)
+		s.filtersMu.Lock()
+		f, ok := s.filters[id]
+		if !ok {
+			s.filtersMu.Unlock()
+			resp.Error = map[string]interface{}{"code": -32000, "message": "filter not found"}
+			break
+		}
+		height := s.chain.Height()
+		switch f.kind {
+		case filterKindBlock:
+			var hashes []string
+			for n := f.lastBlock + 1; n <= height; n++ {
+				if b, err := s.chain.GetByNumber(n); err == nil {
+					hashes = append(hashes, b.Hash)
+				}
+			}
+			f.lastBlock = height
+			s.filtersMu.Unlock()
+			if hashes == nil {
+				hashes = []string{}
+			}
+			resp.Result = hashes
+		case filterKindPending:
+			f.lastBlock = height
+			s.filtersMu.Unlock()
+			resp.Result = []string{}
+		default: // filterKindLog
+			scan := &rpcFilter{kind: filterKindLog, fromBlock: f.lastBlock + 1, toBlock: height, addresses: f.addresses, topics: f.topics}
+			f.lastBlock = height
+			s.filtersMu.Unlock()
+			resp.Result = s.getLogsForFilter(scan)
+		}
 
 	case "eth_uninstallFilter":
+		id := paramStr(req.Params, 0)
+		s.filtersMu.Lock()
+		delete(s.filters, id)
+		s.filtersMu.Unlock()
 		resp.Result = true
 
 	default:
